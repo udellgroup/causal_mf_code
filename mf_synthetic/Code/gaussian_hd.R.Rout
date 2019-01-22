@@ -1,0 +1,91 @@
+
+R version 3.4.3 (2017-11-30) -- "Kite-Eating Tree"
+Copyright (C) 2017 The R Foundation for Statistical Computing
+Platform: x86_64-apple-darwin15.6.0 (64-bit)
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+> source("helper.R")
+Loading required package: Matrix
+Loaded softImpute 1.4
+
+Loading required package: lattice
+Loading required package: ggplot2
+Loading required package: foreach
+Loaded glmnet 2.0-13
+
+
+Attaching package: ‘rARPACK’
+
+The following objects are masked from ‘package:RSpectra’:
+
+    eigs, eigs_sym, svds
+
+
+Attaching package: ‘purrr’
+
+The following objects are masked from ‘package:foreach’:
+
+    accumulate, when
+
+The following object is masked from ‘package:caret’:
+
+    lift
+
+The following object is masked from ‘package:testthat’:
+
+    is_null
+
+> 
+> args <- commandArgs(TRUE)
+> rep_number = as.numeric(args[1])
+> perturbation = get(args[2])
+> recover_pca = get(args[3])
+> save_name = args[4]
+> Date = args[5]
+> # nseq = seq(150, 1500, by = 150)
+> # pseq = nseq - 50
+> nseq = c(30, 40)
+> pseq = nseq - 5
+> treat_coef = c(1, 2, 2, 2, 2)
+> out_coef = c(-2, 3, -2, -3, -2)
+> 
+> 
+> 
+> 
+> result = main_cv(nseq, pseq, treat_coef, out_coef, true_te = 2, true_r = 5, r_seq = c(1,3,5,7,9), noise_level = 5, rep_number = rep_number, 
++                  funs = c(regress_unbiased, regress_svd, regress_corrupted_lasso, regress_corrupted_ridge, regress_corrupted_ols), 
++                  perturbation. = perturbation,  recover_pca. = recover_pca)
+the 1  th p: 25 
+the 1  th n: 30 
+the 1  th repetition 
+the 2  th repetition 
+the 3  th repetition 
+the 2  th p: 35 
+the 2  th n: 40 
+the 1  th repetition 
+the 2  th repetition 
+the 3  th repetition 
+> 
+> output_dir = paste0("../Output/", Date, "/")
+> if (!dir.exists(output_dir)){
++ 	dir.create(output_dir)
++ }
+> 
+> saveRDS(result, paste0("../Output/", Date, "/", save_name, "_hd.rds"))
+> 
+> proc.time()
+   user  system elapsed 
+ 11.590   0.477  31.873 

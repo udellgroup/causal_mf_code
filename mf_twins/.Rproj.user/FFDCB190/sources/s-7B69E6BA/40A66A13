@@ -1,0 +1,22 @@
+{
+    "collab_server" : "",
+    "contents" : "",
+    "created" : 1546842697119.000,
+    "dirty" : false,
+    "encoding" : "UTF-8",
+    "folds" : "",
+    "hash" : "0",
+    "id" : "40A66A13",
+    "lastKnownWriteTime" : 1546850518,
+    "last_content_update" : 1546850518442,
+    "path" : "~/Desktop/mf_twins_code/Code/causal.R",
+    "project_path" : "Code/causal.R",
+    "properties" : {
+        "cursorPosition" : "6,17",
+        "scrollLine" : "0"
+    },
+    "relative_order" : 3,
+    "source_on_save" : false,
+    "source_window" : "",
+    "type" : "r_source"
+}

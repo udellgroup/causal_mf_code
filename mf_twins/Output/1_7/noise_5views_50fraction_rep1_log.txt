@@ -1,0 +1,12 @@
+07-Jan 14:50:56:INFO:root:n_views: 5
+
+07-Jan 14:50:56:INFO:root:corrup_p: 0.5
+
+07-Jan 14:50:59:INFO:root:size of x:((100, 5)[1], (100, 5)[2])
+
+07-Jan 14:50:59:INFO:root:send data to workers
+
+07-Jan 14:51:00:INFO:root:create sharedarray
+
+07-Jan 14:51:35:INFO:root:fit the best model
+

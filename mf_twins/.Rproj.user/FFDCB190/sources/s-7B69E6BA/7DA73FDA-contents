@@ -1,0 +1,1076 @@
+library(assertthat)
+library(onehot)
+library(glmnet)
+
+# in this code file, fraction always corresponds to the noise corruption probability 
+
+bin_col = c("alcohol", "anemia", "cardiac", "chyper", "diabetes", "eclamp",
+            "herpes", "hydra", "incervix", "lung", "othermr", "phyper", "pre4000", "preterm", "renal", "rh",
+            "tobacco", "uterine", "hemo", "bord", "dmar", "csex")
+ord_col = c("adequacy",  "nprevistq", "dfageq", 
+            "dlivord_min", "dtotord_min", "meduc6", "feduc6", "cigar6", "drink5", "mager8")
+cat_col = c("birattnd", "mpre5", "brstate",  "frace", "mplbir", "mplbir_reg",
+            "ormoth", "orfath",  "pldel", "brstate_reg", "crace",  "mrace")
+confounder = "gestat10"
+
+##########################
+#  Convenience
+###########################
+impute_by_mode <- function(data){
+  data2 = data
+  missing = sapply(names(data), function(x) sum(is.na(data[x])) > 0)
+  for (name in names(data)[missing]){
+    freq = sort(table((data[name])), decreasing = T)
+    data2[name][is.na(data[name])] = as.integer(names(freq[1]))
+  }
+  data2
+}
+drop_missing <- function(data){
+  complete = complete.cases(data)
+  data[complete, ]
+}
+
+# one_hot_transform <- function(data, cols){
+#   temp_data = data[cols]
+#   for (name in cols){
+#     temp_data[, name] = as.factor(temp_data[, name])
+#   }
+#   temp_data = predict(onehot(temp_data, addNA = F, max_levels = 60), temp_data)
+#   diff_cols = setdiff(colnames(data), cols)
+#   data = cbind(data[diff_cols], temp_data)
+#   data
+# }
+
+partial_one_hot_col <- function(n_views){
+  # this function generates the column names for the noisy confounders:
+  #   gestat10, gestat10_2, ..., gestat10_n
+  if (n_views > 1){
+    total_corrup = c(confounder, sapply(confounder, function(x) sapply(1:(n_views-1), function(n) paste0(x, "_", n+1))))
+  } else {
+    total_corrup = confounder
+  }
+  total_corrup
+}
+
+# total_one_hot_col <- function(n_views){
+  
+#   transform_cols = union(cat_col, ord_col)  # cols that need to be transformed other than the confounder 
+#   total_cols = union(bin_col, transform_cols) # all cols other than confounders
+  
+#   total_corrup = partial_one_hot_col(n_views)
+  
+#   #total_bin_col = c(bin_col, grep("dmar*", total_corrup, value = T), grep("csex*", total_corrup, value = T))
+#   # total_ord_col = c(ord_col, grep("gestat10*", total_corrup, value = T), grep("mager8*", total_corrup, value = T))
+#   #total_cat_col = c(cat_col, grep("brstate_reg*", total_corrup, value = T), grep("mrace*", total_corrup, value = T), 
+#   #                  grep("crace*", total_corrup, value = T))
+#   transform_cols_mf = total_cols
+#   transform_cols_lr = union(total_cols, total_corrup)
+#   list(cols_mf = transform_cols_mf, cols_lr = transform_cols_lr)
+# }
+
+sigmoid  = function(x){
+  1/(1 + exp(-x))
+}
+
+# merge_levels = function(data){
+#   for (var in c("brstate", "mplbir")){
+#     freq = sort(table(data[var]))
+#     level1 = sapply(names(freq)[freq < dim(data)[1]*0.01], as.integer)
+#     level1_index = sapply(data[, var], function(x) x %in% level1)
+#     data[level1_index, var] = 999
+#   }
+#   data
+# }
+
+
+build_matrixfac_data_thin <- function(U, comp_data, n_views){
+  # this function combines y, t and the factor U from matrix factorization
+  cbind(comp_data[, 1:2], U)
+}
+# build_matrixfac_data_fat <- function(U, comp_data, n_views){
+#   # this function combine the factor with all of the rest of the covariates
+#   p = ncol(comp_data)
+#   cbind(comp_data[, -c((p-(n_views-1)):p)], U)
+# }
+# build_corrup_data_fat <- function(comp_data, n_views){
+#   comp_data
+# }
+# build_matrixfac_data_oh <- function(U, comp_data, n_views, mf_cols){
+#   p = ncol(comp_data)
+#   data = cbind(comp_data[, -c((p-(n_views - 1)):p)], U)
+#   data = one_hot_transform(data, mf_cols)
+#   data
+# }
+# build_matrixfac_data_oh <- function(U, comp_data, n_views, mf_cols){
+#   p = ncol(comp_data)
+#   data = cbind(comp_data[, -c((p-4):p)], U)
+#   data = one_hot_transform(data, mf_cols)
+#   data
+# }
+
+# build_corrup_data_oh <- function(comp_data, n_views, lr_cols){
+#   p = ncol(comp_data)
+#   data = one_hot_transform(comp_data, lr_cols)
+#   data
+# }
+build_corrup_data_thin <- function(comp_data, n_views){
+  # this function combine y and t with the noisy proxies 
+  p = ncol(comp_data)
+  cols = partial_one_hot_col(n_views)
+  cbind(comp_data[, c(1:2)], comp_data[, cols])
+}
+
+
+
+########################
+#  Combine Metrics
+########################
+compute_bias <- function(error, true){
+  abs(rowMeans(error) - true)
+}
+compute_sd <- function(error, true){
+  apply(error, 1, sd)
+}
+compute_error <- function(error, true){
+  sqrt(rowMeans((error - true)^2))
+}
+combine_metrics <- function(input_list, true){
+  # this function receives the list of ate estimates from different methods (each list component corresponds
+  # to one method; each component is a matrix with row corresponding to the dimension and column corresponding
+  # to different repetitions  
+  # true is the true ate, which is -0.025 in this dataset 
+  error_list = list()
+  bias_list = list()
+  sd_list = list()
+  mean_list = list()
+  
+  for (i in 1:length(input_list)){
+    error_list[[i]] = compute_error(input_list[[i]], true)
+    bias_list[[i]] = compute_bias(input_list[[i]], true)
+    sd_list[[i]] = compute_sd(input_list[[i]], true)
+    mean_list[[i]] = rowMeans(input_list[[i]])
+  }
+  # result = data.frame(error = unlist(error_list), bias = unlist(bias_list), sd = unlist(sd_list), 
+  #                     mean_ate = unlist(mean_list), type = rep(names(input_list), each = nrow(input_list[[1]])))
+  result = data.frame(error = unlist(error_list), bias = unlist(bias_list), sd = unlist(sd_list), 
+                      mean_ate = unlist(mean_list), type = rep(names(input_list), each = nrow(input_list[[1]])))
+  result
+}
+
+main_mice <- function(n_views_seq, rep_seq, m, miss, fraction, Date = "5_9/", sub_dir = "twins_total/miss_by_views/"){
+  # this function generates mice imputation for missing data with different n_views and rep settings  
+  # m is the number of multiple imputations for each dataset 
+  # the saved rds file is a length-m list of the imputed datasets
+  for (i in 1:length(n_views_seq)){
+    print(paste("the", i, "th n_views:", n_views_seq[i]))
+    for (j in 1:length(rep_seq)){
+      print(paste("the", j, "th rep"))
+      
+      comp_data = read.csv(paste0(dir, "Data/twins/", "5_9/missing_new/", "noise_", n_views_seq[i], 
+                                  "views_", fraction, "fraction_rep", rep_seq[j], "missing_", miss,".csv"))[1:50, -c(1)]
+      corrup_data = build_corrup_data_thin(comp_data, n_views_seq[i])
+      
+      x = corrup_data[, -c(1:2)]
+      
+      result = mice_impute(x, n_views_seq[i], m) 
+      
+      output_path = paste0(dir, sub_dir,  n_views_seq[i], "views_", fraction, "fraction_rep", rep_seq[j], "missing_", miss, "mice.rds")
+      saveRDS(result, output_path)
+    }
+  }
+}
+
+mice_impute <- function(x, n_views, m){
+  mice.out = mice(x, m = m, print = F)$imp
+  
+  cols = partial_one_hot_col(n_views)
+  assert_that(length(cols) == length(mice.out))
+  
+  imputed_data = vector("list", m)
+  
+  for (i in 1:length(imputed_data)){
+    imputed_data[[i]] = x
+    for (col in cols){
+      temp = unlist(mice.out[[col]][i])
+      imputed_data[[i]][col][is.na(imputed_data[[i]][col])] = temp
+    }
+  }
+  imputed_data
+}
+
+mc_impute <- function(n_views_seq, rep_seq, number_impute = 5, fraction = 0.5, Date = "5_9/", sub_dir = "twins_total/by_views/"){
+  # this function generates mice imputation for missing data with different n_views and rep settings
+
+  for (i in 1:length(n_views_seq)){
+    print(paste("the", i, "th views:", n_views_seq[i]))
+    for (j in 1:length(rep_seq)){
+      print(paste("the", j, "th repetition"))
+      
+      U = read.csv(paste0(dir, sub_dir, "noise_", n_views_seq[i],
+                          "views_", fraction*100, "fraction_rep", rep_seq[j], "miss30_U", ".csv"))
+      V = read.csv(paste0(dir, sub_dir, "noise_", n_views_seq[i],
+                          "views_", fraction*100, "fraction_rep", rep_seq[j], "miss30_V", ".csv"))
+      comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "missing_new/", "noise_", n_views_seq[i],
+                                  "views_", fraction*100, "fraction_rep", rep_seq[j], "missing_30.csv"))[, -1]
+      
+      total_corrup = partial_one_hot_col(n_views_seq[i])
+      X = comp_data[total_corrup]
+      missing = is.na(X)
+      param = as.matrix(U) %*% as.matrix(t(V))
+      prob = exp(param)
+      
+      impute_data = list()
+      for (n in 1:number_impute){
+        impute_data[[n]] = X
+        for (l in 1:n_views_seq[i]){
+          for (m in 1:nrow(X)){
+            if (missing[m, l]){
+              impute_data[[n]][m, l] = sample(1:10, 1, prob = prob[m, ((l-1)*10+1):(10*l)])
+            }
+          }
+        }
+      }
+      
+      saveRDS(impute_data, paste0(dir, sub_dir, "noise_", n_views_seq[i],
+                                  "views_", fraction*100, "fraction_rep", rep_seq[j], "miss30_mc_impute", ".rds"))
+    }
+  } 
+}
+
+
+compute_metrics_by_missing <- function(n_views_seq, rep_seq, miss, fraction, dir){
+  # this function generates ate estimates list for three methods with missing data:
+  #   logistic regression on the output U from matrix factorization
+  #   logistic regression on the corrupted data X with missing values imputed by column-wise mode
+  #   logistic regression on the multiple imputation from matrix factorization 
+
+
+  mf = matrix(0, length(n_views_seq), length(rep_seq))
+  #ate_mf_ridge = matrix(0, length(miss_seq), length(rep_seq))
+  #ate_lr_drop = matrix(0, length(n_views_seq), length(rep_seq))
+  lr_mode = matrix(0, length(n_views_seq), length(rep_seq))
+  lr_mc = matrix(0, length(n_views_seq), length(rep_seq))
+  
+  #ate_ridge_lr_drop = matrix(0, length(n_views_seq), length(rep_seq))
+  # ate_lr_ridge = matrix(0, length(miss_seq), length(rep_seq))
+  
+  for (i in 1:length(n_views_seq)){
+    print(paste("the", i, "th n_views:", n_views_seq[i]))
+    for (j in 1:length(rep_seq)){
+      print(paste("the", j, "th rep"))
+        U = read.csv(paste0(dir, "twins_total/miss_by_views/", "noise_", n_views_seq[i], "views_", fraction, 
+                          "fraction_rep", rep_seq[j], "miss", miss, "_U",".csv"))
+        A = read.csv(paste0(dir, "twins_total/miss_by_views/", "noise_", n_views_seq[i], "views_", fraction, 
+                            "fraction_rep", rep_seq[j], "miss", miss, "_A",".csv"))
+        comp_data = read.csv(paste0(dir, "Data/twins/", "5_9/missing_new/", "noise_", n_views_seq[i], 
+                                  "views_", fraction, "fraction_rep", rep_seq[j], "missing_", miss,".csv"))[, -c(1)]
+      
+      
+
+        mf_data = build_matrixfac_data_thin(U, comp_data, n_views_seq[i])
+        corrup_data = build_corrup_data_thin(comp_data, n_views_seq[i])
+        impute_data = cbind(mf_data[, 1:2], A)
+        
+        mf[i, j] = lr(mf_data)
+        lr_mode[i, j] = lr(impute_by_mode(corrup_data))
+        lr_mc[i, j] = lr(impute_data)
+      
+    }
+  }
+  ate_list = list(mf = mf, lr_mode = lr_mode, 
+                  lr_mc = lr_mc)
+  ate_list
+}
+
+
+
+
+
+# compute_metrics_by_fraction <- function(fraction_seq, n_views, rep_seq, Date = "5_9/", sub_dir = "mf_cat/",
+#                                         thin = T){
+#   
+#   #ate_mf_drop = matrix(0, length(n_views_seq), length(rep_seq))
+#   ate_mf = matrix(0, length(fraction_seq), length(rep_seq))
+#   ate_mf_ridge = matrix(0, length(fraction_seq), length(rep_seq))
+#   #ate_lr_drop = matrix(0, length(n_views_seq), length(rep_seq))
+#   ate_lr = matrix(0, length(fraction_seq), length(rep_seq))
+#   #ate_ridge_lr_drop = matrix(0, length(n_views_seq), length(rep_seq))
+#   ate_lr_ridge = matrix(0, length(fraction_seq), length(rep_seq))
+#   
+#   for (i in 1:length(fraction_seq)){
+#     print(paste("the", i, "th fraction"))
+#     for (j in 1:length(rep_seq)){
+#       print(paste("the", j, "th repetition"))
+#       # U = read.csv(paste0(dir, "Output/twins/", Date , sub_dir, "noise_", n_views_seq[i], 
+#       #                     "views_", fraction, "fraction_rep", rep_seq[j], ".csv"))
+#       U = read.csv(paste0(dir, sub_dir, "noise_", n_views, 
+#                           "views_", fraction_seq[i], "fraction_rep", rep_seq[j], ".csv"))
+#       comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "noise_", n_views, 
+#                                   "views_", fraction_seq[i], "fraction_rep", rep_seq[j], ".csv"))[, -c(1)]
+#       
+#       mf_data = build_matrixfac_data_fat(U, comp_data, n_views)
+#       corrup_data = build_corrup_data_fat(comp_data, n_views)
+#       
+#       # ate_mf[i, j] = lr(mf_data)
+#       
+#       #ate_mf_drop[i, j] = lr(drop_missing(mf_data))
+#       ate_mf[i, j] = lr(impute_by_mode(mf_data))
+#       ate_mf_ridge[i, j] = ridge_lr(impute_by_mode(mf_data))
+#       #ate_lr_drop[i, j] = lr(drop_missing(corrup_data))
+#       ate_lr[i, j] = lr(impute_by_mode(corrup_data))
+#       #ate_ridge_lr_drop[i, j] = ridge_lr(drop_missing(corrup_data))
+#       ate_lr_ridge[i, j] = ridge_lr(impute_by_mode(corrup_data))
+#     }
+#   }
+#   # ate_list = list(mf_drop = ate_mf, mf_mode = ate_mf_mode, lr_drop = ate_lr_drop, 
+#   #                 lr_mode = ate_lr_mode, ridge_drop = ate_ridge_lr_drop, 
+#   #                 ridge_mode = ate_ridge_lr_mode)
+#   ate_list = list(mf = ate_mf, mf_ridge = ate_mf_ridge, 
+#                   lr = ate_lr, lr_ridge = ate_lr_ridge)
+#   #result = combine_metrics_by_fraction(ate_list, -0.025)
+#   #fraction = rep(fraction_seq, length(ate_list))
+#   #result = cbind(result, fraction)
+#   #result
+#   ate_list
+# }
+
+
+
+compute_pw_by_views <- function(n_views_seq, rep_seq, miss = 0, fraction = 0.5, Date = "5_9/", sub_dir = "twins_total/by_views/"){
+  # this function generates ate estimates list for two methods with complete noise data
+  #   propensity score reweighting with propensity estimated from logistic regression on the U from matrix factorization
+  #   propensity score reweighting with propensity estimated from logistic regression on the corrupted data
+
+  ate_mf = matrix(0, length(n_views_seq), length(rep_seq))
+  # ate_corrup = matrix(0, length(n_views_seq), length(rep_seq))
+  # ate_oracle = matrix(0, length(n_views_seq), length(rep_seq))
+  ate_corrup_ridge = matrix(0, length(n_views_seq), length(rep_seq))
+  
+  for (i in 1:length(n_views_seq)){
+    print(paste("the", i, "th views:", n_views_seq[i]))
+    for (j in 1:length(rep_seq)){
+      print(paste("the", j, "th repetition"))
+      
+      U = read.csv(paste0(dir, sub_dir, "noise_", n_views_seq[i], 
+                          "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))
+      if (miss == 0){
+        comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "noise_", n_views_seq[i], 
+                                    "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))[, -c(1)]
+      }
+      
+      # orig_data = read.csv(paste0(dir, "Data/twins/comp_data.csv"))[, -1]
+      
+      
+      if (miss == 0){
+        total_corrup = partial_one_hot_col(n_views_seq[i])
+        X = comp_data[total_corrup];  ### possibly impute here 
+        y = comp_data[, 1]; t = comp_data[, 2];
+        # gestat10 = orig_data["gestat10"]
+      }
+      
+      prop_score = propensity_score(U, y, t, X, gestat10)
+      score = prop_score$mf
+      ate_mf[i, j] = mean(y*t/score) - mean(y*(1-t)/(1-score))
+      score = prop_score$corrup
+      ate_corrup[i, j] = mean(y*t/score) - mean(y*(1-t)/(1-score))
+      # score = prop_score$oracle
+      # ate_oracle[i, j] = mean(y*t/score) - mean(y*(1-t)/(1-score))
+      # score = prop_score$corrup_ridge
+      # ate_corrup_ridge[i, j] = mean(y*t/score) - mean(y*(1-t)/(1-score))
+    
+      
+    }
+  }
+  list(mf = ate_mf, corrup = ate_corrup, oracle = ate_oracle, corrup_ridge = ate_corrup_ridge)
+}
+
+compute_dr_by_views <- function(n_views_seq, rep_seq, miss = 0, fraction = 0.5, Date = "5_9/", sub_dir = "twins_total/by_views/"){
+  # this function generates ate estimates list for doubly robust methods with complete noise data
+  #   both regresion and propensity score are estimated by logistic regression on U from matrix factorization
+  #   both regresion and propensity score are estimated by logistic regression on corrupted data
+
+  ate_mf = matrix(0, length(n_views_seq), length(rep_seq))
+  ate_corrup = matrix(0, length(n_views_seq), length(rep_seq))
+  
+  for (i in 1:length(n_views_seq)){
+    print(paste("the", i, "th views:", n_views_seq[i]))
+    for (j in 1:length(rep_seq)){
+      print(paste("the", j, "th repetition"))
+      
+      
+      U = read.csv(paste0(dir, sub_dir, "noise_", n_views_seq[i], 
+                          "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))
+      if (miss == 0){
+        comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "noise_", n_views_seq[i], 
+                                    "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))[, -1]
+      }
+      
+      # orig_data = read.csv(paste0(dir, "Data/twins/comp_data.csv"))[, -1]
+      
+      
+      if (miss == 0){
+        total_corrup = partial_one_hot_col(n_views_seq[i])
+        X = comp_data[total_corrup];  ### possibly impute here 
+        y = comp_data[, 1]; t = comp_data[, 2];
+        # gestat10 = orig_data["gestat10"]
+      }
+      
+      prop_score = propensity_score(U, t, X)
+      
+      # mf 
+      data = data.frame(y = y, t = t, U = U)
+      lr = glm(y ~ ., data = data, family = binomial)
+      score = as.matrix(cbind(rep(1, dim(data)[1]), data[, -c(1:2)]))%*%coefficients(lr)[-2]
+      m1 = sigmoid(score + coefficients(lr)[2])
+      m0 = sigmoid(score)
+      ps = prop_score$mf
+      ate_dr_mf = mean(t*y/ps - (t - ps)/ps*m1) - mean((1-t)*y/(1-ps) + (t-ps)/(1-ps)*m0)
+      
+      # corrup
+      data = data.frame(y = y, t = t, X = X)
+      lr = glm(y ~ ., data = data, family = binomial)
+      score = as.matrix(cbind(rep(1, dim(data)[1]), data[, -c(1:2)]))%*%coefficients(lr)[-2]
+      m1 = sigmoid(score + coefficients(lr)[2])
+      m0 = sigmoid(score)
+      ps = prop_score$corrup
+      ate_dr_corrup = mean(t*y/ps - (t - ps)/ps*m1) - mean((1-t)*y/(1-ps) + (t-ps)/(1-ps)*m0)
+      
+      ate_mf[i, j] = ate_dr_mf
+      ate_corrup[i , j] = ate_dr_corrup   
+      
+   }
+  }
+  list(dr_mf = ate_mf, dr_corrup = ate_corrup)
+}
+
+propensity_score <- function(U, t, X){
+  data_mf = as.data.frame(cbind(t, U))
+  pw_mf = glm(t ~ ., family = binomial, data = data_mf)
+  pw_mf = predict(pw_mf, type = "response")
+  
+  data_corrup = as.data.frame(cbind(t, X))
+  pw_corrup = glm(t ~ ., family = binomial, data = data_corrup)
+  pw_corrup = predict(pw_corrup, type = "response") 
+  
+  list(mf = pw_mf, corrup = pw_corrup)
+}
+
+
+# match_estimator <- function(y, t, weights){
+#   sum(y[t == 1]*weights[t==1])/sum(weights[t==1]) - sum(y[t == 0]*weights[t==0])/sum(weights[t==0])
+# }
+
+# compute_matchit_by_views <- function(n_views_seq, rep_seq, miss = 0, fraction = 0.5, Date = "5_9/", sub_dir = "twins_total/by_views/"){
+#   ate_mf = matrix(0, length(n_views_seq), length(rep_seq))
+#   ate_corrup = matrix(0, length(n_views_seq), length(rep_seq))
+  
+#   options("optmatch_max_problem_size" = Inf)
+  
+#   for (i in 1:length(n_views_seq)){
+#     print(paste("the", i, "th views:", n_views_seq[i]))
+#     for (j in 1:length(rep_seq)){
+#       print(paste("the", j, "th repetition"))
+      
+#       U = read.csv(paste0(dir, sub_dir, "noise_", n_views_seq[i], 
+#                           "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))
+#       if (miss == 0){
+#         comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "noise_", n_views_seq[i], 
+#                                     "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))[, -1]
+#       }
+      
+#       if (miss == 0){
+#         total_corrup = partial_one_hot_col(n_views_seq[i])
+#         X = comp_data[total_corrup];  ### possibly impute here 
+#         y = comp_data[, 1]; t = comp_data[, 2];
+#         # gestat10 = orig_data["gestat10"]
+#       }
+      
+#       data_mf = data.frame(y = y, t = t, U = U)
+#       data_corrup = cbind(y, t, X)
+#       m.out_mf <- matchit(as.formula(paste("t ~", Reduce(function(x, y) paste(x, "+", y), colnames(data_mf)[-c(1:2)]))),
+#                           data = data_mf, method = "full")
+#       # m.out_mf <- matchit(t ~ U,
+#       #                     data = data_mf, method = "full", distance = "mahalanobis")
+#       data = match.data(m.out_mf)
+#       ate_mf[i, j] = match_estimator(data$y, data$t, data$weights)
+#       # m.out_corrup = matchit(as.formula(paste("t ~", Reduce(function(x, y) paste(x, "+", y), total_corrup))), 
+#       #                        data = data_corrup, method = "full", distance = "mahalanobis")
+#       m.out_corrup = matchit(as.formula(paste("t ~", Reduce(function(x, y) paste(x, "+", y), total_corrup))), 
+#                              data = data_corrup, method = "full")
+#       data = match.data(m.out_corrup)
+#       ate_corrup[i, j] = match_estimator(data$y, data$t, data$weights)
+      
+      
+#     }
+#   }
+#   list(mf = ate_mf, corrup = ate_corrup)
+# }
+
+
+
+
+
+
+# library(optmatch)
+# data(nuclearplants)
+# nuke.nopt <- subset(nuclearplants, pt == 0)
+# mm = fullmatch(pr ~ date + cap, data = nuke.nopt)
+# data.frame(nuke.nopt, matches = mm, check.rows=TRUE)
+
+# compute_match_by_views(n_views_seq, rep_seq, miss = 0, fraction = 0.5, Date = "5_9/", sub_dir = "twins_total/by_views/")
+
+
+
+
+
+compute_propmatch_by_views <- function(n_views_seq, rep_seq, dir, miss = 0, fraction = 0.5, Date = "5_9/", sub_dir = "twins_total/by_views/"){
+  # propensity score matching with propensity score estimated from either U (from matrix factorization) or
+  # corrupt data X; the matching is implemted by fullmatch in the optmatch package 
+
+  ate_mf = matrix(0, length(n_views_seq), length(rep_seq))
+  ate_corrup = matrix(0, length(n_views_seq), length(rep_seq))
+  
+  options("optmatch_max_problem_size" = Inf)
+  
+  for (i in 1:length(n_views_seq)){
+    print(paste("the", i, "th views:", n_views_seq[i]))
+    for (j in 1:length(rep_seq)){
+      print(paste("the", j, "th repetition"))
+      
+      U = read.csv(paste0(dir, sub_dir, "noise_", n_views_seq[i],
+                          "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))
+      if (miss == 0){
+        comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "noise_", n_views_seq[i],
+                                    "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))[, -1]
+      }
+      
+      if (miss == 0){
+        total_corrup = partial_one_hot_col(n_views_seq[i])
+        X = comp_data[total_corrup];  ### possibly impute here
+        y = comp_data[, 1]; t = comp_data[, 2];
+        # gestat10 = orig_data["gestat10"]
+      }
+      
+      data_mf = data.frame(y = y, t = t, U = U)
+      data_corrup = cbind(y, t, X)
+      
+      data = data_mf
+      model = glm(t ~ . - y, data = data, family = binomial)
+      match  = fullmatch(model, data = data)
+      mf = fullmatch_estimator(match, data)
+      
+      data = data_corrup
+      model = glm(t ~ . - y, data = data, family = binomial)
+      match  = fullmatch(model, data = data)
+      corrup = fullmatch_estimator(match, data)
+      
+      ate_mf[i, j] = mf
+      ate_corrup[i, j] = corrup
+    }
+  }
+  list(mf = ate_mf, corrup = ate_corrup)
+}
+
+compute_optmatch_by_views_parallel <- function(n_views_seq, rep_seq, miss = 0, fraction = 0.5, Date = "5_9/", sub_dir = "twins_total/by_views/"){
+    # full matching  on either U (from matrix factorization) or
+    # corrupt data X; the matching is implemted by fullmatch in the optmatch package 
+
+  ate_mf = matrix(0, length(n_views_seq), length(rep_seq))
+  ate_corrup = matrix(0, length(n_views_seq), length(rep_seq))
+  
+  for (i in 1:length(n_views_seq)){
+    print(paste("the", i, "th views:", n_views_seq[i]))
+    result = foreach(j = 1:length(rep_seq), .combine = cbind, .packages = "optmatch") %dopar% {
+      print(paste("the", j, "th repetition"))
+      
+      U = read.csv(paste0(dir, sub_dir, "noise_", n_views_seq[i],
+                          "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))[1:50, ]
+      if (miss == 0){
+        comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "noise_", n_views_seq[i],
+                                    "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))[1:50, -1]
+      }
+      
+      if (miss == 0){
+        total_corrup = partial_one_hot_col(n_views_seq[i])
+        X = comp_data[total_corrup];  ### possibly impute here
+        y = comp_data[, 1]; t = comp_data[, 2];
+        # gestat10 = orig_data["gestat10"]
+      }
+      
+      data_mf = data.frame(y = y, t = t, U = U)
+      data_corrup = cbind(y, t, X)
+      
+      
+      data = data_mf
+      match = fullmatch(as.formula(paste("t ~", Reduce(function(x, y) paste(x, "+", y), colnames(data_mf)[-c(1:2)]))), data = data, method = "mahalanobis")
+      mf = fullmatch_estimator(match, data)
+      
+      data = data_corrup
+      match = fullmatch(as.formula(paste("t ~", Reduce(function(x, y) paste(x, "+", y), total_corrup))), data = data, method = "mahalanobis")
+      corrup = fullmatch_estimator(match, data)
+      
+      result = matrix(c(mf, corrup), 2, 1)
+      rownames(result) = c("mf", "corrup")
+      result
+    }
+    ate_mf[i, ] = result[1, ]
+    ate_corrup[i, ] = result[2, ]
+  }
+  
+  final = list(mf = ate_mf, corrup = ate_corrup)
+}
+
+fullmatch_estimator <- function(match, data){
+  # estimate the ate based on the matching pair output 
+  groups = levels(match)
+  ate_group = numeric(length(groups))
+  for (i in 1:length(groups)){
+    group = groups[i]
+    elements = as.numeric(names(match[match == group]))
+    group_data = data[elements, ]
+    ate_group[i] = mean(group_data$y[group_data$t == 1]) - mean(group_data$y[group_data$t == 0])
+  }
+  mean(ate_group)
+}
+
+
+# compute_matching_by_views <- function(n_views_seq, rep_seq, miss = 0, fraction = 0.5, Date = "5_9/", sub_dir = "twins_total/by_views/"){
+#   ate_mf = matrix(0, length(n_views_seq), length(rep_seq))
+#   ate_corrup = matrix(0, length(n_views_seq), length(rep_seq))
+
+#   for (i in 1:length(n_views_seq)){
+#     print(paste("the", i, "th views:", n_views_seq[i]))
+#     for (j in 1:length(rep_seq)){
+#       print(paste("the", j, "th repetition"))
+
+#       U = read.csv(paste0(dir, sub_dir, "noise_", n_views_seq[i],
+#                           "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))[1:50, ]
+#       if (miss == 0){
+#         comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "noise_", n_views_seq[i],
+#                                     "views_", fraction*100, "fraction_rep", rep_seq[j], ".csv"))[1:50, -1]
+#       }
+
+#       if (miss == 0){
+#         total_corrup = partial_one_hot_col(n_views_seq[i])
+#         X = comp_data[total_corrup];  ### possibly impute here
+#         y = comp_data[, 1]; t = comp_data[, 2];
+#         # gestat10 = orig_data["gestat10"]
+#       }
+
+#       data_mf = data.frame(y = y, t = t, U = U)
+#       data_corrup = cbind(y, t, X)
+      
+      
+#       mf_match = Match(Y = data_mf$y, Tr = data_mf$t, X = data_mf[, -c(1:2)], estimand = "ATE", M = 1, ties = TRUE, replace = TRUE)
+#       corrup_match = Match(Y = data_corrup$y, Tr = data_corrup$t, X = data_corrup[, -c(1,2)], estimand = "ATE", M = 1, ties = TRUE, replace = TRUE)
+
+#       ate_mf[i, j] = c(mf_match$est)
+#       ate_corrup[i, j] = c(corrup_match$est)
+#     }
+#   }
+#   list(mf = ate_mf, corrup = ate_corrup)
+# }
+
+
+
+
+
+
+compute_metrics_by_fraction <- function(fraction_seq, n_views, rep_seq, Date = "5_9/", sub_dir = "mf_cat/",
+                                        thin = T){
+  # this function generates ate estimates for logistic regression on either U from matrix factorization 
+  #    or the corrupted dataset X
+
+  #ate_mf_drop = matrix(0, length(n_views_seq), length(rep_seq))
+  ate_mf = matrix(0, length(fraction_seq), length(rep_seq))
+  # ate_mf_ridge = matrix(0, length(fraction_seq), length(rep_seq))
+  #ate_lr_drop = matrix(0, length(n_views_seq), length(rep_seq))
+  ate_lr = matrix(0, length(fraction_seq), length(rep_seq))
+  #ate_ridge_lr_drop = matrix(0, length(n_views_seq), length(rep_seq))
+  # ate_lr_ridge = matrix(0, length(fraction_seq), length(rep_seq))
+  
+  for (i in 1:length(fraction_seq)){
+    print(paste("the", i, "th fraction"))
+    for (j in 1:length(rep_seq)){
+      print(paste("the", j, "th repetition"))
+      # U = read.csv(paste0(dir, "Output/twins/", Date , sub_dir, "noise_", n_views_seq[i], 
+      #                     "views_", fraction, "fraction_rep", rep_seq[j], ".csv"))
+      U = read.csv(paste0(dir, sub_dir, "noise_", n_views, 
+                          "views_", fraction_seq[i], "fraction_rep", rep_seq[j], ".csv"))
+      comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "noise_", n_views, 
+                                  "views_", fraction_seq[i], "fraction_rep", rep_seq[j], ".csv"))[, -c(1)]
+      
+      
+      if (thin){
+        mf_data = build_matrixfac_data_thin(U, comp_data, n_views)
+        corrup_data = build_corrup_data_thin(comp_data, n_views)
+        
+        ate_mf[i, j] = lr(mf_data)
+        ate_mf_ridge[i, j] = ridge_lr(mf_data)
+        ate_lr[i, j] = lr(corrup_data)
+        ate_lr_ridge[i, j] = ridge_lr(corrup_data)
+      } else {
+        mf_data = build_matrixfac_data_fat(U, comp_data, n_views)
+        corrup_data = build_corrup_data_fat(comp_data, n_views)
+        
+        ate_mf[i, j] = lr(impute_by_mode(mf_data))
+        ate_mf_ridge[i, j] = ridge_lr(impute_by_mode(mf_data))
+        ate_lr[i, j] = lr(impute_by_mode(corrup_data))
+        ate_lr_ridge[i, j] = ridge_lr(impute_by_mode(corrup_data))
+      }
+      
+    }
+  }
+  # ate_list = list(mf_drop = ate_mf, mf_mode = ate_mf_mode, lr_drop = ate_lr_drop, 
+  #                 lr_mode = ate_lr_mode, ridge_drop = ate_ridge_lr_drop, 
+  #                 ridge_mode = ate_ridge_lr_mode)
+  ate_list = list(mf = ate_mf, mf_ridge = ate_mf_ridge, 
+                  lr = ate_lr, lr_ridge = ate_lr_ridge)
+  #result = combine_metrics_by_fraction(ate_list, -0.025)
+  #fraction = rep(fraction_seq, length(ate_list))
+  #result = cbind(result, fraction)
+  #result
+  ate_list
+}
+
+# compute_metrics_by_fraction_partial_oht <- function(fraction_seq, n_views, rep_seq, Date = "5_9/", sub_dir = "mf_cat/",
+#                                                     thin = F){
+  
+  
+#   ate_mf = matrix(0, length(fraction_seq), length(rep_seq))
+#   ate_mf_ridge = matrix(0, length(fraction_seq), length(rep_seq))
+#   ate_lr = matrix(0, length(fraction_seq), length(rep_seq))
+#   ate_lr_ridge = matrix(0, length(fraction_seq), length(rep_seq))
+  
+#   for (i in 1:length(fraction_seq)){
+#     print(paste("the", i, "th fraction"))
+#     for (j in 1:length(rep_seq)){
+#       print(paste("the", j, "th repetition"))
+#       U = read.csv(paste0(dir, "twins_total/", "noise_", n_views, 
+#                           "views_", fraction_seq[i], "fraction_rep", rep_seq[j], ".csv"))
+#       comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "noise_", n_views, 
+#                                   "views_", fraction_seq[i], "fraction_rep", rep_seq[j], ".csv"))[, -c(1)]
+      
+#       lr_cols = partial_one_hot_col(n_views)
+#       mf_data = build_matrixfac_data_fat(U, comp_data, n_views)
+#       corrup_data = build_corrup_data_oh(comp_data, n_views, lr_cols)
+      
+#       ate_mf[i, j] = lr(mf_data)
+#       ate_mf_ridge[i, j] = ridge_lr(mf_data)
+#       ate_lr[i, j] = lr(corrup_data)
+#       ate_lr_ridge[i, j] = ridge_lr(corrup_data)
+#     }
+#   }
+  
+#   ate_list = list(mf = ate_mf, mf_ridge = ate_mf_ridge, 
+#                   lr = ate_lr, lr_ridge = ate_lr_ridge)
+#   ate_list
+# }
+
+# compute_metrics_by_fraction_total_oht <- function(fraction_seq, n_views, rep_seq, Date = "5_9/", sub_dir = "mf_cat/",
+#                                                   thin = F){
+  
+  
+#   #ate_mf = matrix(0, length(fraction_seq), length(rep_seq))
+#   ate_mf_ridge = matrix(0, length(fraction_seq), length(rep_seq))
+#   #ate_lr = matrix(0, length(fraction_seq), length(rep_seq))
+#   ate_lr_ridge = matrix(0, length(fraction_seq), length(rep_seq))
+  
+#   for (i in 1:length(fraction_seq)){
+#     print(paste("the", i, "th fraction"))
+#     for (j in 1:length(rep_seq)){
+#       print(paste("the", j, "th repetition"))
+#       U = read.csv(paste0(dir, "twins_total/", "noise_", n_views, 
+#                           "views_", fraction_seq[i], "fraction_rep", rep_seq[j], ".csv"))
+#       comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "noise_", n_views, 
+#                                   "views_", fraction_seq[i], "fraction_rep", rep_seq[j], ".csv"))[, -c(1)]
+      
+#       cols = total_one_hot_col(n_views)
+#       mf_cols = cols$cols_mf
+#       lr_cols = cols$cols_lr
+#       mf_data = build_matrixfac_data_oh(U, comp_data, n_views, mf_cols)
+#       corrup_data = build_corrup_data_oh(comp_data, n_views, lr_cols)
+      
+#       #ate_mf[i, j] = lr(mf_data)
+#       ate_mf_ridge[i, j] = ridge_lr(mf_data)
+#       #ate_lr[i, j] = lr(corrup_data)
+#       ate_lr_ridge[i, j] = ridge_lr(corrup_data)
+#     }
+#   }
+  
+#   # ate_list = list(mf_drop = ate_mf, mf_mode = ate_mf_mode, lr_drop = ate_lr_drop, 
+#   #                 lr_mode = ate_lr_mode, ridge_drop = ate_ridge_lr_drop, 
+#   #                 ridge_mode = ate_ridge_lr_mode)
+#   ate_list = list(ridge_mf = ate_mf_ridge, ridge_lr = ate_lr_ridge)
+#   ate
+# }
+
+
+########################
+##   Regression
+########################
+lr <- function(data){
+  model <- glm(y ~ ., data = data, family = binomial)
+  score = as.matrix(cbind(rep(1, dim(data)[1]), data[, -c(1:2)]))%*%coefficients(model)[-2]
+  mean(sigmoid(score + coefficients(model)[2]) - sigmoid(score))
+}
+
+ridge_lr <- function(data){
+  penalty_factor = rep(1, dim(data)[2]-1)
+  penalty_factor[1] = 0
+  
+  model = cv.glmnet(y = as.matrix(data$y), x = as.matrix(data[, -1]), family = "binomial", alpha = 0, penalty.factor = penalty_factor)
+  length(coef(model, model$lambda.min))
+  
+  X0 = cbind(rep(0, dim(data)[1]), as.matrix(data[, -c(1:2)]))
+  X1 = cbind(rep(1, dim(data)[1]), as.matrix(data[, -c(1:2)]))
+  pred1 = predict(model, newx = X1, type = "response", s = model$lambda.min)
+  pred0 = predict(model, newx = X0, type = "response", s =  model$lambda.min)
+  mean(pred1 - pred0)
+}
+
+# compute_metrics_old <- function(n_views_seq, rep_seq, Date, sub_dir, fraction, thin = F){
+#   ate_mf_mode = matrix(0, length(n_views_seq), length(rep_seq))
+#   #ate_lr_drop = matrix(0, length(n_views_seq), length(rep_seq))
+#   ate_lr_mode = matrix(0, length(n_views_seq), length(rep_seq))
+#   #ate_ridge_lr_drop = matrix(0, length(n_views_seq), length(rep_seq))
+#   ate_ridge_lr_mode = matrix(0, length(n_views_seq), length(rep_seq))
+  
+#   for (i in 1:length(n_views_seq)){
+#     print(paste("the", i, 'th n_views'))
+#     for (j in 1:length(rep_seq)){
+#       U = read.csv(paste0(dir, "Output/twins/", Date , sub_dir, "noise_", n_views_seq[i],
+#                           "views_", fraction, "fraction_rep", rep_seq[j], ".csv"))
+#       print(paste("the", j, 'rep'))
+#       # U = read.csv(paste0(dir, "twins_total/", "noise_", n_views_seq[i], 
+#       #                                         "views_", fraction, "fraction_rep", rep_seq[j], ".csv"))
+#       comp_data = read.csv(paste0(dir, "Data/twins/",  Date, "noise_", n_views_seq[i], 
+#                                   "views_", fraction, "fraction_rep", rep_seq[j], ".csv"))[, -c(1, 2)]
+#       if (thin){
+#         mf_data = build_matrixfac_data_thin(U, comp_data, n_views_seq[i])
+#         corrup_data = build_corrup_data_thin(comp_data, n_views_seq[i])
+#       } else {
+#         mf_data = build_matrixfac_data_fat(U, comp_data, n_views_seq[i])
+#         corrup_data = build_corrup_data_fat(comp_data, n_views_seq[i])
+#       }
+      
+#       # ate_mf[i, j] = lr(mf_data)
+      
+#       #ate_mf_drop[i, j] = lr(drop_missing(mf_data))
+#       ate_mf_mode[i, j] = lr(impute_by_mode(mf_data))
+#       #ate_lr_drop[i, j] = lr(drop_missing(corrup_data))
+#       ate_lr_mode[i, j] = lr(impute_by_mode(corrup_data))
+#       #ate_ridge_lr_drop[i, j] = ridge_lr(drop_missing(corrup_data))
+#       ate_ridge_lr_mode[i, j] = ridge_lr(impute_by_mode(corrup_data))
+#     }
+#   }
+#   # ate_list = list(mf_drop = ate_mf, mf_mode = ate_mf_mode, lr_drop = ate_lr_drop, 
+#   #                 lr_mode = ate_lr_mode, ridge_drop = ate_ridge_lr_drop, 
+#   #                 ridge_mode = ate_ridge_lr_mode)
+#   ate_list = list(mf_mode = ate_mf_mode, 
+#                   lr_mode = ate_lr_mode, 
+#                   ridge_mode = ate_ridge_lr_mode)
+# }
+
+
+
+
+########################
+## Corruption
+########################
+missing <- function(data, frac_missing = 0.3, file_path = NULL, write_file = F){
+  x = data[, -c(1:2)]
+  n = dim(x)[1]; d = dim(x)[2]; n_missing = n*d*frac_missing
+  # I = sample(n, n_missing, replace = T)
+  # J = sample(d, n_missing, replace = T)
+  # for (i in 1:n_missing){
+  #   x[I[i], J[i]] = NA
+  # }
+  #assert_that(sum(is.na(x))/(n*d) == 0)
+  
+  corrup = ifelse(runif(n*d) < frac_missing, T, F)
+  corrup = matrix(corrup, nrow = n)
+  corrup = as.data.frame(corrup)
+  colnames(corrup) = colnames(x)
+  
+  for (name in colnames(x)){
+    x[corrup[, name], name] = NA
+  }
+  
+  data = cbind(data[, 1:2], x)
+  if (write_file){
+    write.csv(data, file_path)
+  }
+  data
+}
+
+# noise <- function(data, n_views, corrup_p = 0.2, file_path = NULL, write_file = F){
+noise <- function(data, n_views, corrup_p = 0.2){
+  x = data[, -c(1:2)]
+  n = dim(x)[1]; d = dim(x)[2]
+
+  na_frac = apply(is.na(x), 2, sum)/dim(x)[1]
+  # nonmiss = colnames(x)[na_frac == 0][-1]
+  nonmiss = "gestat10"
+  total_names = nonmiss
+  xx = x
+  if (n_views > 1){
+    for (i in 1:(n_views - 1)){
+      x2 = x[nonmiss]
+      names(x2) = paste0(names(x[nonmiss]),"_", i + 1)
+      total_names = c(total_names, names(x2))
+      xx = cbind(xx, x2)
+    }
+  }
+  
+  corrup = ifelse(runif(n*length(nonmiss)*n_views) < corrup_p, T, F)
+  corrup = matrix(corrup, nrow = n)
+  corrup = as.data.frame(corrup)
+  colnames(corrup) = total_names
+  
+  for (name in total_names){
+    values =  unname(unlist(unique(xx[name])))
+    n_corrup = sum(corrup[, name])
+    xx[corrup[, name], name] = sample(values, n_corrup, replace = T)
+  }
+  data = cbind(data[, 1:2], xx)
+  # if (write_file){
+  #   write.csv(data,file_path)
+  # }
+  data
+}
+
+noise_gen <- function(data, n_views_seq, corrup_seq, rep_seq, dir_path = paste0(dir, "Data/twins/"), write_file = T){
+  # create noisy proxy variables for the original dataset: note that we first generate the largest noisy
+  # dataset and then smaller noisy dataset is obtained from only keeping the first a few columns of the
+  # largest noisy dataset; this way, we keep the noise patterns across the dimensions 
+
+  if (!dir.exists(file.path(dir_path))){
+    dir.create(dir_path)
+  }
+  
+  conf_name = "gestat10"
+  name_rest = setdiff(names(data), conf_name)
+  data_rest = data[name_rest]
+  
+  for (r in rep_seq){
+    print(paste("rep", r))
+    for (corrup_p in corrup_seq){
+      print(paste("corruption", corrup_p))
+      data2 = noise(data, max(n_views_seq), corrup_p = corrup_p)
+      for (n_views in n_views_seq){
+        print(paste("n_views", n_views))
+        file_path = paste0(dir_path, "noise_", n_views, "views_", corrup_p*100, "fraction_rep", r,".csv")
+        
+        if (n_views == 1){
+          select_names = conf_name
+        } else {
+          select_names = c(conf_name, sapply(1:(n_views-1), function(x) paste0("gestat10","_", x + 1)))
+        }
+        
+        data3 = cbind(data_rest, data2[select_names])
+        write.csv(data3,file_path)
+      }
+    }   
+  }
+}
+
+
+miss_gen <- function(miss_seq, rep_seq, n_views, fraction, complete_data_dir, missing_data_dir){
+  # generate missing dataset 
+
+  for (rep in rep_seq){
+    print(paste("reptition", rep))
+    for (missing_prop in miss_seq){
+      print(paste("missing prop", missing_prop))
+      
+      data = read.csv(paste0(complete_data_dir, "noise_", n_views, "views_", fraction, "fraction_rep", rep, ".csv"))[, -1]
+      
+      total_corrup = partial_one_hot_col(n_views)
+      n = dim(data[total_corrup])[1]; d = dim(data[total_corrup])[2]
+      missing = ifelse(runif(n*d) <= missing_prop, T, F)
+      missing = as.data.frame(matrix(missing, n, d))
+      colnames(missing) = total_corrup
+      
+      for (name in total_corrup){
+        data[missing[, name], name] = NA
+      }
+      
+      write.csv(data, paste0(missing_data_dir, "noise_", n_views, "views_", fraction, "fraction_rep", rep, "missing_", missing_prop*100,
+                             ".csv"))
+      
+    }
+  }
+}
+
+
+
+
+# noise_gen_by_corrup <- function(data, n_views, corrup_seq, rep = 20, dir_path = paste0(dir, "Data/twins/"), write_file = T){
+#   if (!dir.exists(file.path(dir_path))){
+#     dir.create(dir_path)
+#   }
+#   
+#   conf_name = "gestat10"
+#   name_rest = setdiff(names(data), conf_name)
+#   data_rest = data[name_rest]
+#   
+#   for (r in 1:rep){
+#     print(paste("rep", r))
+#     data2 = noise(data, max(n_views_seq), corrup_p = corrup_p)
+#     for (corrup_p in corrup_seq){
+#       print(paste("n_views", n_views))
+#       file_path = paste0(dir_path, "noise_", n_views, "views_", corrup_p*100, "fraction_rep", r,".csv")
+#       
+#       if (n_views == 1){
+#         select_names = conf_name
+#       } else {
+#         select_names = c(conf_name, sapply(1:(n_views-1), function(x) paste0("gestat10","_", x + 1)))
+#       }
+#       
+#       data3 = cbind(data_rest, data2[select_names])
+#       write.csv(data3,file_path)
+#     }
+#   }
+# }
+
+
+
+###################
+#  Plotting
+###################
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}

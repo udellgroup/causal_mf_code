@@ -1,0 +1,22 @@
+{
+    "collab_server" : "",
+    "contents" : "",
+    "created" : 1546780653091.000,
+    "dirty" : false,
+    "encoding" : "UTF-8",
+    "folds" : "",
+    "hash" : "0",
+    "id" : "F7113DDF",
+    "lastKnownWriteTime" : 1546850664,
+    "last_content_update" : 1546850664,
+    "path" : "~/Desktop/mf_twins_code/Code/corrup.R",
+    "project_path" : "Code/corrup.R",
+    "properties" : {
+        "cursorPosition" : "4,20",
+        "scrollLine" : "125"
+    },
+    "relative_order" : 2,
+    "source_on_save" : false,
+    "source_window" : "",
+    "type" : "r_source"
+}
