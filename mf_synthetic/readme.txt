@@ -15,16 +15,17 @@ example:
 	'echo "run dimensional setting {1} with {2} data";R CMD BATCH --vanilla \
 	"--args 3 perturbation_{2} recover_pca_{2}_cv {2}\
 	1_22" {1} {2}_{1}.Rout'  ::: hd.R ld.R hd_missing.R ld_missing.R  ::: gaussian binary
-	remark: 
-	parallel -j this argument specifies how many tasks are run in parallel
-	--args: the argument fed into the R files above, see any of them for details; in this example
-		3 represents 3 repetitions of all experiments
-		perturbation_{2} means running the main_cv() or main_cv_missing() with perturbation_gaussian and perturbation_binary as perturbation. 
-		recover_pca_{2}_cv means running the main_cv() or main_cv_missing() with recover_pca_gaussian_cv and recover_pca_binary_cv as recover_pca.
-		{2} specifies part the names of the saved results 
-		1_22 specifies the subdirectory in Output where the results are stored
-	{1} specify the R files to run
-	{2}_{1}.Rout: specify the name of the Rout logging files 
+remark: 
+	parallel -j: this argument specifies how many tasks are run in parallel
+	--args: the arguments fed into the R files above, see any of these R files for details; 
+		in this example,
+			3 represents 3 repetitions of all experiments
+			perturbation_{2} means running the main_cv() or main_cv_missing() with perturbation_gaussian and perturbation_binary as perturbation. 
+			recover_pca_{2}_cv means running the main_cv() or main_cv_missing() with recover_pca_gaussian_cv and recover_pca_binary_cv as recover_pca.
+			{2} specifies part the names of the saved results 
+			1_22 specifies the subdirectory in Output where the results are stored
+	{1} specifies the R files to run
+	{2}_{1}.Rout specifies the name of the Rout logging files 
 
 _.Rout: the logging files recording the execution of the R codes
 
